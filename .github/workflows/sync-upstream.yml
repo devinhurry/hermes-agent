@@ -1,0 +1,42 @@
+name: Sync personal branch with upstream
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-hermes-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out personal branch
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: personal
+          fetch-depth: 0
+
+      - name: Rebase personal changes and mirror main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git fetch origin main personal
+          git fetch upstream main
+
+          old_main="$(git rev-parse refs/remotes/origin/main)"
+          git push origin upstream/main:main --force-with-lease="main:${old_main}"
+
+          git checkout personal
+          git rebase upstream/main
+          git push origin personal --force-with-lease
