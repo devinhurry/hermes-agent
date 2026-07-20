@@ -2952,7 +2952,58 @@ class FeishuAdapter(BasePlatformAdapter):
         reaction_type_obj = getattr(event, "reaction_type", None)
         emoji_type = str(getattr(reaction_type_obj, "emoji_type", "") or "UNKNOWN")
         action = "added" if "created" in event_type else "removed"
-        synthetic_text = f"reaction:{action}:{emoji_type}"
+        # Include a snippet of the reacted-to message so the agent knows which cron/task this reaction refers to.
+        try:
+            snippet = ""
+            raw_body = getattr(msg, "body", None)
+            body_content_str = str(getattr(raw_body, "content", "") or "")
+            if body_content_str.strip().startswith("{"):
+                parsed = json.loads(body_content_str)
+
+                # Plain text messages: {"text":"..."}
+                if "text" in parsed:
+                    snippet = str(parsed["text"])
+
+                # Feishu rich-text / multi-lingual messages:
+                # {"zh_cn":{"content":[[{"text":"...","style":[]}]],"title":"..."},"en_us":...}
+                elif "zh_cn" in parsed and isinstance(parsed["zh_cn"], dict):
+                    cn = parsed["zh_cn"]
+                    if "title" in cn:
+                        snippet += str(cn["title"]) + " "
+                    for block in cn.get("content", []):
+                        if isinstance(block, list):
+                            for run in block:
+                                if isinstance(run, dict):
+                                    snippet += run.get("text", "")
+                        elif isinstance(block, dict):
+                            snippet += block.get("text", "")
+
+                # Card messages: {"config":{...,"header":{...},"elements":[{...},...]}
+                elif "header" in parsed and "elements" in parsed:
+                    hdr = parsed.get("header", {})
+                    title_obj = hdr.get("title", {})
+                    if isinstance(title_obj, dict):
+                        snippet += str(title_obj.get("content", "") or "")
+                    for el in parsed.get("elements", []):
+                        for run in el.get("fields", el.get("text", {}).get("lines", [])):
+                            if isinstance(run, dict) and "text" in run:
+                                snippet += run["text"]
+
+                # Legacy card-like or other structured formats
+                elif "content" in parsed and isinstance(parsed["content"], list):
+                    for block in parsed["content"]:
+                        for line in block.get("lines", []):
+                            for run in line.get("runs", []):
+                                snippet += run.get("text", "")
+            else:
+                snippet = body_content_str
+            snippet = (snippet or "")[:200].replace("\n", " ").strip()
+        except Exception:
+            logger.debug("[Feishu] Failed to extract reaction context snippet", exc_info=True)
+            snippet = ""
+        ctx_part = f" ctx:{snippet}" if snippet else ""
+        logger.info("[Feishu] Reaction %s:%s on bot message %s, snippet='%s'", action, emoji_type, message_id, snippet[:60])
+        synthetic_text = f"reaction:{action}:{emoji_type}{ctx_part}"
 
         sender_profile = await self._resolve_sender_profile(user_id_obj)
         chat_info = await self.get_chat_info(chat_id)
