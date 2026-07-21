@@ -20,7 +20,7 @@ jobs:
     steps:
       - name: Sync fork main with upstream
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.HERMES_SYNC_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
@@ -34,7 +34,7 @@ jobs:
 
       - name: Merge synchronized main into personal
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.HERMES_SYNC_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
