@@ -16,27 +16,34 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    steps:
-      - name: Check out personal branch
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
-        with:
-          ref: personal
-          fetch-depth: 0
 
-      - name: Rebase personal changes and mirror main
+    steps:
+      - name: Sync fork main with upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git remote add upstream https://github.com/NousResearch/hermes-agent.git
-          git fetch origin main personal
-          git fetch upstream main
+          gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "repos/${GITHUB_REPOSITORY}/merge-upstream" \
+            -f branch=main
 
-          old_main="$(git rev-parse refs/remotes/origin/main)"
-          git push origin upstream/main:main --force-with-lease="main:${old_main}"
+      - name: Merge synchronized main into personal
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
 
-          git checkout personal
-          git rebase upstream/main
-          git push origin personal --force-with-lease
+          gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "repos/${GITHUB_REPOSITORY}/merges" \
+            -f base=personal \
+            -f head=main \
+            -f commit_message="chore: merge upstream main into personal"
