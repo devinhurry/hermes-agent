@@ -47,3 +47,18 @@ jobs:
             -f base=personal \
             -f head=main \
             -f commit_message="chore: merge upstream main into personal"
+
+      - name: Disable imported upstream workflows
+        env:
+          GH_TOKEN: ${{ secrets.HERMES_SYNC_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gh api "repos/${GITHUB_REPOSITORY}/actions/workflows?per_page=100" \
+            --jq '.workflows[] | select(.path != ".github/workflows/sync-upstream.yml" and .state == "active") | .id' |
+            while IFS= read -r workflow_id; do
+              gh api --method PUT \
+                "repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow_id}/disable" \
+                >/dev/null || true
+            done
