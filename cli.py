@@ -471,7 +471,7 @@ def load_cli_config() -> Dict[str, Any]:
             "min_tail_user_messages": 1,  # Real user messages guaranteed in the tail (1 = existing single anchor)
         },
         "agent": {
-            "max_turns": 90,  # Default max tool-calling iterations (shared with subagents)
+            "max_turns": 500,  # Default max tool-calling iterations (shared with subagents)
             "verbose": False,
             "system_prompt": "",
             "prefill_messages_file": "",
@@ -4099,7 +4099,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             provider: Inference provider ("auto", "openrouter", "nous", "openai-codex", "zai", "kimi-coding", "minimax", "minimax-cn")
             api_key: API key (default: from environment)
             base_url: API base URL (default: OpenRouter)
-            max_turns: Maximum tool-calling iterations shared with subagents (default: 90)
+            max_turns: Maximum tool-calling iterations shared with subagents (default: 500)
             verbose: Enable verbose logging
             compact: Use compact display mode
             resume: Session ID to resume (restores conversation history from SQLite)
@@ -4157,6 +4157,22 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         # Inline diff previews for write actions (display.inline_diffs in config.yaml)
         self._inline_diffs_enabled = CLI_CONFIG["display"].get("inline_diffs", True)
+
+        # Per-turn accounting (display.turn_summary / display.spinner_token_flow).
+        # Both are CLI-only, display-only chrome. The collector rides the
+        # tool-progress feed this class already receives, so no agent-loop
+        # bookkeeping is involved.
+        self._turn_summary_enabled = bool(CLI_CONFIG["display"].get("turn_summary", True))
+        self._spinner_token_flow_enabled = bool(
+            CLI_CONFIG["display"].get("spinner_token_flow", True)
+        )
+        self._turn_summary_collector = None
+        self._turn_summary_start = 0.0
+        self._turn_token_baseline = 0
+        # True only while an interactive (run()-loop) turn is in flight. Single
+        # query, -Q, and gateway paths never set it, which is what keeps the
+        # summary line out of non-interactive surfaces.
+        self._interactive_turn = False
 
         # Submitted multiline user-message preview (display.user_message_preview in config.yaml)
         _ump = CLI_CONFIG["display"].get("user_message_preview", {})
@@ -4272,9 +4288,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             try:
                 self.max_turns = int(os.getenv("HERMES_MAX_ITERATIONS", ""))
             except (TypeError, ValueError):
-                self.max_turns = 90
+                self.max_turns = 500
         else:
-            self.max_turns = 90
+            self.max_turns = 500
         
         # Parse and validate toolsets
         self.enabled_toolsets = toolsets
@@ -4460,6 +4476,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._clarify_state = None
         self._clarify_freetext = False
         self._clarify_deadline = 0
+        self._clarify_multi_base = None
         self._sudo_state = None
         self._sudo_deadline = 0
         self._modal_input_snapshot = None
@@ -5121,6 +5138,23 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         except Exception:
             pass
 
+        # Standing /goal state (Ralph loop). GoalManager is cached on self and
+        # keeps its state in memory, so this is a cheap attribute read — no DB
+        # hit per repaint. Only an *active* goal earns a segment; paused/done
+        # goals stay out of the bar (matching the desktop's active-first row).
+        snapshot["goal_active"] = False
+        snapshot["goal_turns_used"] = 0
+        snapshot["goal_max_turns"] = 0
+        try:
+            goal_mgr = self._get_goal_manager()
+            if goal_mgr is not None and goal_mgr.is_active():
+                goal_state = goal_mgr.state
+                snapshot["goal_active"] = True
+                snapshot["goal_turns_used"] = int(getattr(goal_state, "turns_used", 0) or 0)
+                snapshot["goal_max_turns"] = int(getattr(goal_state, "max_turns", 0) or 0)
+        except Exception:
+            pass
+
 
         if not agent:
             return snapshot
@@ -5277,6 +5311,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         txt = getattr(self, "_spinner_text", "")
         if not txt:
             return ""
+        flow = self._spinner_token_flow()
         t0 = getattr(self, "_tool_start_time", 0) or 0
         if t0 > 0:
             elapsed = time.monotonic() - t0
@@ -5288,8 +5323,99 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             else:
                 # Keep width stable before the 60s rollover as well.
                 elapsed_str = f"{elapsed:5.1f}s"
+            if flow:
+                return f"  {txt}  ({elapsed_str} · {flow})"
             return f"  {txt}  ({elapsed_str})"
+        if flow:
+            return f"  {txt}  ({flow})"
         return f"  {txt}"
+
+    # ── Per-turn accounting (display.turn_summary / spinner_token_flow) ──
+    #
+    # Both features are CLI-only chrome. The tally is observed from the
+    # tool-progress callback this class already receives on every tool call,
+    # so nothing is threaded through the agent loop. Token flow reads the
+    # agent's cumulative session counters (bumped per API call in
+    # agent/conversation_loop.py) and subtracts a per-turn baseline.
+
+    def _spinner_token_flow(self) -> str:
+        """Cumulative output tokens for the running turn, for the spinner."""
+        if not getattr(self, "_spinner_token_flow_enabled", False):
+            return ""
+        if not getattr(self, "_agent_running", False):
+            return ""
+        agent = getattr(self, "agent", None)
+        if agent is None:
+            return ""
+        try:
+            from agent.turn_summary import format_token_flow
+
+            produced = (getattr(agent, "session_output_tokens", 0) or 0) - (
+                getattr(self, "_turn_token_baseline", 0) or 0
+            )
+            return format_token_flow(produced)
+        except Exception:
+            return ""
+
+    def _turn_summary_is_active(self) -> bool:
+        """Whether the per-turn summary line should render for this surface.
+
+        Gated off for: the config key, quiet/tool-progress-off mode, and any
+        non-interactive path (single query, ``-Q``, gateway/messaging) — those
+        surfaces either want machine-readable output or carry their own footer.
+        """
+        if not getattr(self, "_turn_summary_enabled", False):
+            return False
+        if getattr(self, "tool_progress_mode", "all") == "off":
+            return False
+        agent = getattr(self, "agent", None)
+        if agent is not None and getattr(agent, "quiet_mode", False):
+            return False
+        if not getattr(self, "_interactive_turn", False):
+            return False
+        return True
+
+    def _turn_summary_begin(self) -> None:
+        """Start per-turn accounting for the turn that is about to run."""
+        try:
+            from agent.turn_summary import TurnSummaryCollector
+
+            collector = getattr(self, "_turn_summary_collector", None)
+            if collector is None:
+                collector = TurnSummaryCollector()
+                self._turn_summary_collector = collector
+            collector.begin()
+            self._turn_summary_start = time.monotonic()
+            agent = getattr(self, "agent", None)
+            self._turn_token_baseline = (
+                getattr(agent, "session_output_tokens", 0) or 0
+            ) if agent is not None else 0
+        except Exception:
+            self._turn_summary_collector = None
+
+    def _turn_summary_record(self, function_name, result, is_error: bool) -> None:
+        """Feed one completed tool call into the active tally."""
+        collector = getattr(self, "_turn_summary_collector", None)
+        if collector is None:
+            return
+        try:
+            collector.record_tool(function_name, result=result, is_error=bool(is_error))
+        except Exception:
+            pass
+
+    def _turn_summary_emit(self) -> None:
+        """Print the post-turn accounting line, when enabled for this surface."""
+        collector = getattr(self, "_turn_summary_collector", None)
+        if collector is None or not self._turn_summary_is_active():
+            return
+        try:
+            started = getattr(self, "_turn_summary_start", 0.0) or 0.0
+            elapsed = max(0.0, time.monotonic() - started) if started else 0.0
+            line = collector.render(elapsed)
+            if line:
+                _cprint(f"  {_DIM}{line}{_RST}")
+        except Exception:
+            logger.debug("Turn summary render failed", exc_info=True)
 
     # ── Petdex mascot (base-CLI pet pane) ───────────────────────────────
     #
@@ -5563,6 +5689,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         cont = " | Continuous" if self._voice_continuous else ""
         return [("class:voice-status", f" 🎤 Voice mode{tts}{cont}  —  {label} to record ")]
 
+    @staticmethod
+    def _status_bar_goal_segment(snapshot: Dict[str, Any]) -> str:
+        """Return the ``⊙ goal 3/20`` segment, or ``""`` when no goal is active.
+
+        Active-goal-only by design: paused/done goals don't occupy status-bar
+        real estate (they already print their own glyph lines in the thread).
+        """
+        if not snapshot.get("goal_active"):
+            return ""
+        used = snapshot.get("goal_turns_used") or 0
+        max_turns = snapshot.get("goal_max_turns") or 0
+        if max_turns:
+            return f"⊙ goal {used}/{max_turns}"
+        return "⊙ goal"
+
     def _build_status_bar_text(self, width: Optional[int] = None) -> str:
         """Return a compact one-line session status string for the TUI footer."""
         try:
@@ -5576,8 +5717,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             battery_prefix = f"{battery_label} │ " if battery_label else ""
 
             yolo_active = self._is_session_yolo_active()
+            goal_segment = self._status_bar_goal_segment(snapshot)
             if width < 52:
                 text = f"{battery_prefix}⚕ {snapshot['model_short']} · {duration_label}"
+                if goal_segment:
+                    text += f" · {goal_segment}"
                 if yolo_active:
                     text += " · ⚠ YOLO"
                 return self._trim_status_bar_text(text, width)
@@ -5597,6 +5741,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 bg_subagent_count = snapshot.get("active_background_subagents", 0)
                 if bg_subagent_count:
                     parts.append(f"⛓ {bg_subagent_count}")
+                if goal_segment:
+                    parts.append(goal_segment)
                 parts.append(duration_label)
                 if yolo_active:
                     parts.append("⚠ YOLO")
@@ -5624,6 +5770,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             bg_subagent_count = snapshot.get("active_background_subagents", 0)
             if bg_subagent_count:
                 parts.append(f"⛓ {bg_subagent_count}")
+            if goal_segment:
+                parts.append(goal_segment)
             parts.append(duration_label)
             prompt_elapsed = snapshot.get("prompt_elapsed")
             if prompt_elapsed:
@@ -5650,6 +5798,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             width = self._get_tui_terminal_width()
             duration_label = snapshot["duration"]
             yolo_active = self._is_session_yolo_active()
+            goal_segment = self._status_bar_goal_segment(snapshot)
             battery_label = snapshot.get("battery_label") or ""
             battery_style = self._battery_status_style(snapshot.get("battery_category", "dim"))
 
@@ -5660,6 +5809,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     ("class:status-bar-dim", " · "),
                     ("class:status-bar-dim", duration_label),
                 ]
+                if goal_segment:
+                    frags.append(("class:status-bar-dim", " · "))
+                    frags.append(("class:status-bar-strong", goal_segment))
                 if yolo_active:
                     frags.append(("class:status-bar-dim", " · "))
                     frags.append(("class:status-bar-yolo", "⚠ YOLO"))
@@ -5690,6 +5842,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     if bg_subagent_count:
                         frags.append(("class:status-bar-dim", " · "))
                         frags.append(("class:status-bar-strong", f"⛓ {bg_subagent_count}"))
+                    if goal_segment:
+                        frags.append(("class:status-bar-dim", " · "))
+                        frags.append(("class:status-bar-strong", goal_segment))
                     frags.extend([
                         ("class:status-bar-dim", " · "),
                         ("class:status-bar-dim", duration_label),
@@ -5733,6 +5888,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     if bg_subagent_count:
                         frags.append(("class:status-bar-dim", " │ "))
                         frags.append(("class:status-bar-strong", f"⛓ {bg_subagent_count}"))
+                    if goal_segment:
+                        frags.append(("class:status-bar-dim", " │ "))
+                        frags.append(("class:status-bar-strong", goal_segment))
                     frags.extend([
                         ("class:status-bar-dim", " │ "),
                         ("class:status-bar-dim", duration_label),
@@ -9462,6 +9620,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 self._handle_skills_command(cmd_original)
         elif canonical == "learn":
             self._handle_learn_command(cmd_original)
+        elif canonical == "init":
+            self._handle_init_command(cmd_original)
         elif canonical == "memory":
             self._handle_memory_command(cmd_original)
         elif canonical == "platforms":
@@ -11249,6 +11409,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         if event_type == "tool.completed":
             self._tool_start_time = 0.0
+            # Per-turn accounting: this feed already sees every tool call with
+            # its result, so the summary line needs no agent-loop state.
+            self._turn_summary_record(
+                function_name, kwargs.get("result"), kwargs.get("is_error", False)
+            )
             # Print stacked scrollback line for "new" / "all" / "verbose" modes.
             # "verbose" was previously omitted here, so non-streaming model
             # calls (MoA aggregator, copilot-acp) rendered each tool only into
@@ -11893,7 +12058,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             outcome = outcome[:119] + "…"
         _cprint(f"\n{_DIM}{icon} {label}: {detail} → {outcome}{_RST}")
 
-    def _clarify_callback(self, question, choices):
+    def _clarify_callback(self, question, choices, multi_select=False):
         """
         Platform callback for the clarify tool. Called from the agent thread.
 
@@ -11901,6 +12066,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         questions), then blocks until the user responds via the prompt_toolkit
         key bindings.  If no response arrives within the configured timeout the
         question is dismissed and the agent is told to decide on its own.
+
+        When ``multi_select`` is True, shows checkboxes and the user can
+        select multiple options with Space, confirming with Enter.
         """
         import time as _time
 
@@ -11911,16 +12079,22 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         timeout = resolve_clarify_timeout(CLI_CONFIG)
         response_queue = queue.Queue()
         is_open_ended = not choices
+        # multi-select support: only active when multi_select is True and choices exist
+        effective_multi = multi_select and not is_open_ended
 
         self._clarify_state = {
             "question": question,
             "choices": choices if not is_open_ended else [],
             "selected": 0,
+            # multi-select support
+            "multi_select": effective_multi,
+            "selected_indices": set() if effective_multi else None,
             "response_queue": response_queue,
         }
         self._clarify_deadline = None if timeout <= 0 else _time.monotonic() + timeout
         # Open-ended questions skip straight to freetext input
         self._clarify_freetext = is_open_ended
+        self._clarify_multi_base = None
 
         # Trigger an immediate prompt_toolkit repaint from this (non-main)
         # thread. Modal prompts must paint at once and must not be gated by the
@@ -11953,6 +12127,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._clarify_state = None
         self._clarify_freetext = False
         self._clarify_deadline = None
+        self._clarify_multi_base = None
         self._paint_now()
         _cprint(f"\n{_DIM}(clarify timed out after {timeout}s — agent will decide){_RST}")
         return (
@@ -12375,6 +12550,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 pass
             self._clarify_state = None
             self._clarify_freetext = False
+            self._clarify_multi_base = None
         if self._sudo_state:
             try:
                 self._sudo_state["response_queue"].put("")
@@ -13128,8 +13304,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # Notify when iteration budget was hit
             if result and not result.get("completed") and not result.get("interrupted"):
                 _api_calls = result.get("api_calls", 0)
-                if _api_calls >= getattr(self.agent, "max_iterations", 90):
-                    _max_iter = getattr(self.agent, "max_iterations", 90)
+                if _api_calls >= getattr(self.agent, "max_iterations", 500):
+                    _max_iter = getattr(self.agent, "max_iterations", 500)
                     _cprint(
                         f"\n{_DIM}⚠ Iteration budget reached "
                         f"({_api_calls}/{_max_iter}) — "
@@ -13924,6 +14100,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             if self._clarify_freetext and self._clarify_state:
                 text = event.app.current_buffer.text.strip()
                 if text:
+                    # multi-select: prepend previously checked real choices
+                    base = getattr(self, '_clarify_multi_base', None)
+                    if base:
+                        text = ", ".join(base) + ", " + text
+                        self._clarify_multi_base = None
                     self._clarify_state["response_queue"].put(text)
                     self._clarify_state = None
                     self._clarify_freetext = False
@@ -13936,6 +14117,35 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 state = self._clarify_state
                 selected = state["selected"]
                 choices = state.get("choices") or []
+                # multi-select support: submit comma-joined list of checked choices
+                if state.get("multi_select"):
+                    indices = state.get("selected_indices")
+                    if not indices:
+                        # Nothing checked → submit empty string (parses to [])
+                        state["response_queue"].put("")
+                        self._clarify_state = None
+                        event.app.invalidate()
+                        return
+                    sorted_idx = sorted(indices)
+                    selected_choices = [choices[i] for i in sorted_idx if i < len(choices)]
+                    other_checked = len(choices) in sorted_idx
+                    if other_checked and selected_choices:
+                        # "Other" + real choices: store base choices, switch to freetext
+                        # so the user can type a custom answer that gets appended
+                        self._clarify_multi_base = selected_choices
+                        self._clarify_freetext = True
+                        event.app.invalidate()
+                        return
+                    if selected_choices:
+                        state["response_queue"].put(", ".join(selected_choices))
+                        self._clarify_state = None
+                        event.app.invalidate()
+                        return
+                    # Only "Other" was checked → switch to freetext
+                    self._clarify_freetext = True
+                    event.app.invalidate()
+                    return
+                # Original single-select behavior: submit the highlighted choice
                 if selected < len(choices):
                     state["response_queue"].put(choices[selected])
                     self._clarify_state = None
@@ -14170,11 +14380,42 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 self._clarify_state["selected"] = min(max_idx, self._clarify_state["selected"] + 1)
                 event.app.invalidate()
 
+        # multi-select support: Space toggles the checkbox at the current cursor position
+        @kb.add('space', filter=Condition(lambda: bool(self._clarify_state) and not self._clarify_freetext and self._clarify_state.get("multi_select")))
+        def clarify_toggle(event):
+            if self._clarify_state:
+                selected = self._clarify_state["selected"]
+                indices = self._clarify_state.get("selected_indices", set())
+                if selected in indices:
+                    indices.discard(selected)
+                else:
+                    indices.add(selected)
+                event.app.invalidate()
+
         # Number keys for quick clarify selection (1-9, 0 for 10th item)
         def _make_clarify_number_handler(idx):
             def handler(event):
                 if self._clarify_state and not self._clarify_freetext:
                     choices = self._clarify_state.get("choices") or []
+                    # multi-select support: number keys toggle checkboxes instead of submitting
+                    if self._clarify_state.get("multi_select"):
+                        if idx < len(choices):
+                            indices = self._clarify_state.get("selected_indices", set())
+                            if idx in indices:
+                                indices.discard(idx)
+                            else:
+                                indices.add(idx)
+                            event.app.invalidate()
+                        elif idx == len(choices):
+                            # Toggle "Other" in multi-select mode
+                            indices = self._clarify_state.get("selected_indices", set())
+                            if idx in indices:
+                                indices.discard(idx)
+                            else:
+                                indices.add(idx)
+                            event.app.invalidate()
+                        return
+                    # Original single-select: number keys submit directly
                     # Map index to choice (treating "Other" as the last option)
                     if idx < len(choices):
                         # Select a numbered choice
@@ -15067,6 +15308,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             question = state["question"]
             choices = state.get("choices") or []
             selected = state.get("selected", 0)
+            # multi-select support
+            multi_select = state.get("multi_select", False)
+            selected_indices = state.get("selected_indices", set()) if multi_select else set()
             preview_lines = _wrap_panel_text(question, 60)
             for i, choice in enumerate(choices):
                 # Show number prefix for quick selection (1-9 for items 1-9, 0 for 10th item)
@@ -15076,7 +15320,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     num_prefix = '0'
                 else:
                     num_prefix = ' '
-                if i == selected and not cli_ref._clarify_freetext:
+                if multi_select:
+                    cb = "[x]" if i in selected_indices else "[ ]"
+                    if i == selected and not cli_ref._clarify_freetext:
+                        prefix = f"❯ {cb} {num_prefix}. "
+                    else:
+                        prefix = f"  {cb} {num_prefix}. "
+                elif i == selected and not cli_ref._clarify_freetext:
                     prefix = f"❯ {num_prefix}. "
                 else:
                     prefix = f"  {num_prefix}. "
@@ -15089,11 +15339,20 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 other_num_prefix = '0'
             else:
                 other_num_prefix = ' '
-            other_label = (
-                f"❯ {other_num_prefix}. Other (type below)" if cli_ref._clarify_freetext
-                else f"❯ {other_num_prefix}. Other (type your answer)" if selected == len(choices)
-                else f"  {other_num_prefix}. Other (type your answer)"
-            )
+            other_idx_val = len(choices)
+            if multi_select:
+                cb = "[x]" if other_idx_val in selected_indices else "[ ]"
+                other_label = (
+                    f"❯ {cb} {other_num_prefix}. Other (type below)" if cli_ref._clarify_freetext
+                    else f"❯ {cb} {other_num_prefix}. Other (type your answer)" if selected == other_idx_val
+                    else f"  {cb} {other_num_prefix}. Other (type your answer)"
+                )
+            else:
+                other_label = (
+                    f"❯ {other_num_prefix}. Other (type below)" if cli_ref._clarify_freetext
+                    else f"❯ {other_num_prefix}. Other (type your answer)" if selected == len(choices)
+                    else f"  {other_num_prefix}. Other (type your answer)"
+                )
             preview_lines.extend(_wrap_panel_text(other_label, 60, subsequent_indent="    "))
             box_width = _panel_box_width("Hermes needs your input", preview_lines)
             inner_text_width = max(8, box_width - 2)
@@ -15109,7 +15368,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         num_prefix = '0'
                     else:
                         num_prefix = ' '
-                    if i == selected and not cli_ref._clarify_freetext:
+                    # multi-select support: add checkbox after cursor indicator
+                    if multi_select:
+                        cb = "[x]" if i in selected_indices else "[ ]"
+                        if i == selected and not cli_ref._clarify_freetext:
+                            prefix = f'❯ {cb} {num_prefix}. '
+                        else:
+                            prefix = f'  {cb} {num_prefix}. '
+                    elif i == selected and not cli_ref._clarify_freetext:
                         prefix = f'❯ {num_prefix}. '
                     else:
                         prefix = f'  {num_prefix}. '
@@ -15124,12 +15390,22 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     other_num_prefix = '0'
                 else:
                     other_num_prefix = ' '
-                if selected == other_idx and not cli_ref._clarify_freetext:
-                    other_label_mand = f'❯ {other_num_prefix}. Other (type your answer)'
-                elif cli_ref._clarify_freetext:
-                    other_label_mand = f'❯ {other_num_prefix}. Other (type below)'
+                # multi-select support: add checkbox to Other option
+                if multi_select:
+                    cb = "[x]" if other_idx in selected_indices else "[ ]"
+                    if selected == other_idx and not cli_ref._clarify_freetext:
+                        other_label_mand = f'❯ {cb} {other_num_prefix}. Other (type your answer)'
+                    elif cli_ref._clarify_freetext:
+                        other_label_mand = f'❯ {cb} {other_num_prefix}. Other (type below)'
+                    else:
+                        other_label_mand = f'  {cb} {other_num_prefix}. Other (type your answer)'
                 else:
-                    other_label_mand = f'  {other_num_prefix}. Other (type your answer)'
+                    if selected == other_idx and not cli_ref._clarify_freetext:
+                        other_label_mand = f'❯ {other_num_prefix}. Other (type your answer)'
+                    elif cli_ref._clarify_freetext:
+                        other_label_mand = f'❯ {other_num_prefix}. Other (type below)'
+                    else:
+                        other_label_mand = f'  {other_num_prefix}. Other (type your answer)'
                 other_wrapped = _wrap_panel_text(other_label_mand, inner_text_width, subsequent_indent="    ")
             elif cli_ref._clarify_freetext:
                 # Freetext-only mode: the guidance line takes the place of choices.
@@ -15794,8 +16070,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
                     # Regular chat - run agent
                     self._agent_running = True
+                    self._interactive_turn = True
                     self._pet_turn_error = False
                     self._pet_reasoning = False
+                    self._turn_summary_begin()
                     app.invalidate()  # Refresh status line
 
                     try:
@@ -15808,6 +16086,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         self._last_scrollback_tool = ""
                         self._pet_reasoning = False
                         self._pet_react_turn_end()
+                        # Post-turn accounting line (display.turn_summary).
+                        # Emitted after the response box, before the prompt
+                        # returns, so it reads as a footer for the turn.
+                        self._turn_summary_emit()
+                        self._interactive_turn = False
 
                         app.invalidate()  # Refresh status line
 
