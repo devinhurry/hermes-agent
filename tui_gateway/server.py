@@ -6387,16 +6387,25 @@ def _append_inflight_delta(session: dict, delta: Any) -> None:
     session["inflight_turn"] = turn
 
 
-def _replace_inflight_user(session: dict, text: Any) -> None:
-    """Reflect an accepted correction as the live turn's current user text."""
-    user = _inflight_text(text)
-    if not user:
+def _record_inflight_correction(session: dict, text: Any) -> None:
+    """Record an accepted mid-turn correction on the live turn.
+
+    The correction is appended, never written over ``user``: a resuming client
+    must be able to rebuild BOTH bubbles. Overwriting the slot erased the
+    prompt that started the turn from the only snapshot resume can read, so a
+    reconnect (or a dev hot-reload that wipes the renderer cache) repainted the
+    thread with the user's original message missing.
+    """
+    correction = _inflight_text(text)
+    if not correction:
         return
     turn = session.get("inflight_turn")
     if not isinstance(turn, dict):
         return
     turn = dict(turn)
-    turn["user"] = user
+    corrections = list(turn.get("corrections") or [])
+    corrections.append(correction)
+    turn["corrections"] = corrections
     turn["updated_at"] = time.time()
     session["inflight_turn"] = turn
 
@@ -6689,7 +6698,7 @@ def _handle_busy_submit(
         try:
             if agent.redirect(plain_text):
                 with session["history_lock"]:
-                    _replace_inflight_user(session, plain_text)
+                    _record_inflight_correction(session, plain_text)
                     session["last_active"] = time.time()
                 return _ok(rid, {"status": "redirected"})
         except Exception:
@@ -6760,6 +6769,11 @@ def _inflight_snapshot(session: dict) -> dict | None:
         "streaming": streaming,
         "user": user,
     }
+    corrections = [c for c in (turn.get("corrections") or []) if str(c).strip()]
+    if corrections:
+        # Mid-turn redirects. Carried alongside the original prompt (not over
+        # it) so resume can rebuild every user bubble the turn produced.
+        snapshot["corrections"] = [str(c) for c in corrections]
     if error:
         # Retained failed turn (see _fail_inflight_turn): carry the error
         # semantics so a resuming client can rebuild the failed-turn bubble
@@ -10753,7 +10767,7 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 5000, f"redirect failed: {exc}")
     if accepted:
         with session["history_lock"]:
-            _replace_inflight_user(session, text)
+            _record_inflight_correction(session, text)
             session["last_active"] = time.time()
     return _ok(
         rid,
@@ -13351,6 +13365,70 @@ def _(rid, params: dict) -> dict:
                 agent.verbose_logging = nv == "verbose"
         return _ok(rid, {"key": key, "value": nv})
 
+    if key == "focus":
+        # Focus view — display-only reduced-output mode (/focus). Composes with
+        # the tool_progress machinery rather than duplicating it: enabling it
+        # pins tool_progress to "off" (the same value /verbose off uses) after
+        # stashing the configured mode, and disabling it restores that mode.
+        # Nothing about the request payload changes.
+        from hermes_cli.focus_view import (
+            FOCUS_TOOL_PROGRESS_MODE,
+            normalize_tool_progress_mode,
+            resolve_focus_arg,
+        )
+
+        cfg_f = _load_cfg()
+        _display_f = cfg_f.get("display")
+        d_f: dict = _display_f if isinstance(_display_f, dict) else {}
+        cur_focus = bool(d_f.get("focus_view", False))
+        action, target = resolve_focus_arg(str(value or ""), cur_focus)
+        if action == "usage":
+            return _err(rid, 4002, f"unknown focus value: {value} (use on|off|status)")
+        if action == "status" or target is None:
+            return _ok(
+                rid,
+                {
+                    "key": key,
+                    "value": "on" if cur_focus else "off",
+                    "tool_progress": _load_tool_progress_mode(),
+                },
+            )
+
+        if target:
+            saved = normalize_tool_progress_mode(
+                (d_f.get("focus_saved_tool_progress") or _load_tool_progress_mode())
+                if cur_focus
+                else _load_tool_progress_mode()
+            )
+            _write_config_key("display.focus_saved_tool_progress", saved)
+            _write_config_key("display.tool_progress", FOCUS_TOOL_PROGRESS_MODE)
+            effective = FOCUS_TOOL_PROGRESS_MODE
+        else:
+            saved = normalize_tool_progress_mode(
+                d_f.get("focus_saved_tool_progress") or "all"
+            )
+            _write_config_key("display.tool_progress", saved)
+            effective = saved
+        _write_config_key("display.focus_view", bool(target))
+
+        if session:
+            session["focus_view"] = bool(target)
+            session["tool_progress_mode"] = effective
+            agent_f = session.get("agent")
+            if agent_f is not None:
+                try:
+                    agent_f.tool_progress_mode = effective
+                except Exception:
+                    pass
+        return _ok(
+            rid,
+            {
+                "key": key,
+                "value": "on" if target else "off",
+                "tool_progress": effective,
+            },
+        )
+
     if key in {"approval_mode", "approvals.mode"}:
         raw = str(value or "").strip().lower()
         if raw not in _APPROVAL_MODES:
@@ -14538,6 +14616,13 @@ def _(rid, params: dict) -> dict:
             display.get("tui_statusbar", "top") if isinstance(display, dict) else "top"
         )
         return _ok(rid, {"value": _coerce_statusbar(raw)})
+    if key == "focus":
+        display = _load_cfg().get("display")
+        on = bool(display.get("focus_view", False)) if isinstance(display, dict) else False
+        return _ok(
+            rid,
+            {"value": "on" if on else "off", "tool_progress": _load_tool_progress_mode()},
+        )
     if key == "mouse":
         display = _load_cfg().get("display")
         return _ok(rid, {"value": _display_mouse_tracking(display)})
@@ -15418,6 +15503,49 @@ def _(rid, params: dict) -> dict:
             )
         except Exception as exc:
             return _err(rid, 5030, f"moa unavailable: {exc}")
+
+    if name == "focus":
+        # /focus is display-only. Route it through the same config.set branch the
+        # Ink TUI slash command uses so both surfaces share one state machine and
+        # one persistence path. Returns a plain notice line for the transcript.
+        from hermes_cli.focus_view import (
+            format_focus_status,
+            format_focus_toggle_message,
+            resolve_focus_arg,
+        )
+
+        _display_focus = _load_cfg().get("display")
+        _d_focus: dict = _display_focus if isinstance(_display_focus, dict) else {}
+        _cur_focus = bool(_d_focus.get("focus_view", False))
+        _action, _target = resolve_focus_arg(arg, _cur_focus)
+        if _action == "usage":
+            return _err(rid, 4004, "usage: /focus [on|off|status]")
+        if _action == "status":
+            _saved = _d_focus.get("focus_saved_tool_progress") or _load_tool_progress_mode()
+            return _ok(
+                rid,
+                {"type": "exec", "output": format_focus_status(_cur_focus, _saved)},
+            )
+        _res = _methods["config.set"](
+            rid,
+            {
+                "key": "focus",
+                "value": "on" if _target else "off",
+                "session_id": params.get("session_id", ""),
+            },
+        )
+        if "error" in _res:
+            return _res
+        _payload = _res.get("result") or {}
+        return _ok(
+            rid,
+            {
+                "type": "exec",
+                "output": format_focus_toggle_message(
+                    bool(_target), _payload.get("tool_progress") or "all"
+                ),
+            },
+        )
 
     if name == "retry":
         if not session:
