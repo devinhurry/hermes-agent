@@ -1962,7 +1962,7 @@ DEFAULT_CONFIG = {
         # class of over-claim that otherwise forces users to run
         # `git status` to verify edits landed.  Set false to suppress.
         "file_mutation_verifier": True,
-        # Nous credits status-bar notices (usage bands, grant-spent, depleted /
+        # Nous credits status-bar notices (usage bands, depleted /
         # restored).  When false, no credits notices are emitted — balance data
         # is still captured and /usage keeps working.  Off switch for sub +
         # top-up users who find the gauge noisy.
@@ -3428,6 +3428,14 @@ DEFAULT_CONFIG = {
         # reads connected accounts silently). "off" -> plain intro only.
         # The offer fires at most once (latched under onboarding.seen).
         "profile_build": "ask",
+    },
+
+    # Privacy-safe aggregate metrics written only to this profile's local
+    # telemetry directory. Collection is opt-in and no remote sink exists.
+    "telemetry": {
+        "shared_metrics": {
+            "enabled": False,
+        },
     },
 
     # ``hermes update`` behaviour.
