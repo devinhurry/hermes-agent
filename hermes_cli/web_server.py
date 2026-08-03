@@ -169,10 +169,40 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
 
 
 def _warm_gateway_module() -> None:
-    try:
-        import hermes_cli.gateway  # noqa: F401
-    except Exception:
-        pass
+    """Pre-import heavy modules so the event loop is not stalled on first use.
+
+    On a cold Windows install, importing these module chains triggers .pyc
+    compilation and Defender real-time scans that can stall the event loop
+    for 15-30s. The original fix (pre-#60800) only warmed
+    ``hermes_cli.gateway``. But the first WS connection and its initial
+    RPC burst (``setup.status``, ``setup.runtime_check``,
+    ``gateway.ready``→``resolve_skin``) pull in several *other* heavy
+    chains that were still imported on the loop thread, contributing to
+    the ~14s cold-start stall (#60800). Warm them all here so the cost
+    is paid in a worker thread while the server socket is already open.
+    """
+    for mod in (
+        "hermes_cli.gateway",
+        # setup.status / setup.runtime_check resolve provider auth state,
+        # which imports copilot_auth (→ subprocess module) and scans
+        # credential files. First import is noticeably slow on Windows.
+        "hermes_cli.auth",
+        "hermes_cli.copilot_auth",
+        "hermes_cli.runtime_provider",
+        # resolve_skin() reads config + initialises the skin engine.
+        # Even though handle_ws now calls it via asyncio.to_thread
+        # (see tui_gateway/ws.py), warming it here avoids the first-call
+        # import cost inside that thread.
+        "hermes_cli.skin_engine",
+        # model.options / picker context — parses provider catalogs and
+        # the models.dev cache on first use.
+        "hermes_cli.inventory",
+        "hermes_cli.model_switch",
+    ):
+        try:
+            __import__(mod)
+        except Exception:
+            pass
 
 
 def _resolve_restart_drain_timeout() -> float:
@@ -5573,6 +5603,12 @@ def _normalize_memory_provider_schema(name: str, provider: Any) -> List[Dict[str
             kind = "select"
         elif explicit_kind in {"bool", "boolean"} or isinstance(raw.get("default"), bool):
             kind = "boolean"
+        elif explicit_kind in {"int", "integer"} or (
+            isinstance(raw.get("default"), int) and not isinstance(raw.get("default"), bool)
+        ):
+            kind = "integer"
+        elif explicit_kind in {"float", "number"} or isinstance(raw.get("default"), float):
+            kind = "number"
         else:
             kind = "text"
 
@@ -5593,6 +5629,9 @@ def _normalize_memory_provider_schema(name: str, provider: Any) -> List[Dict[str
             "options": options,
             "url": str(raw.get("url") or ""),
             "when": raw.get("when") if isinstance(raw.get("when"), dict) else None,
+            "minimum": raw.get("minimum"),
+            "maximum": raw.get("maximum"),
+            "step": raw.get("step"),
             "_env_key": str(raw.get("env_var") or "") or None,
         })
 
@@ -5736,6 +5775,9 @@ def _public_memory_provider_field(field: Dict[str, Any], data: Dict[str, Any]) -
         "options": field.get("options", []),
         "url": field.get("url", ""),
         "when": field.get("when"),
+        "minimum": field.get("minimum"),
+        "maximum": field.get("maximum"),
+        "step": field.get("step"),
     }
     return entry
 
@@ -5757,6 +5799,31 @@ def _memory_provider_payload(name: str, provider: Any) -> Dict[str, Any]:
 def _coerce_schema_field(field: Dict[str, Any], raw: Any) -> Any:
     if field["kind"] == "boolean":
         return _coerce_bool(raw, default=_coerce_bool(_field_default(field), default=False))
+
+    if field["kind"] in {"integer", "number"}:
+        value = raw if raw is not None and raw != "" else _field_default(field)
+        try:
+            if isinstance(value, bool):
+                raise ValueError
+            parsed = float(value)
+            if not math.isfinite(parsed):
+                raise ValueError
+            if field["kind"] == "integer":
+                if not parsed.is_integer():
+                    raise ValueError
+                result: int | float = int(parsed)
+            else:
+                result = parsed
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"Invalid numeric value for '{field['key']}'") from exc
+
+        minimum = field.get("minimum")
+        maximum = field.get("maximum")
+        if minimum is not None and result < minimum:
+            raise ValueError(f"'{field['key']}' must be at least {minimum}")
+        if maximum is not None and result > maximum:
+            raise ValueError(f"'{field['key']}' must be at most {maximum}")
+        return result
 
     value = str(raw if raw is not None else "").strip()
     if field["kind"] == "select":
@@ -15927,6 +15994,14 @@ def _render_active_theme_bootstrap_css() -> str:
         return ""
 
 
+# Hashed bundle assets (``/assets/<name>-<contenthash>.<ext>``) are immutable
+# by construction: any content change produces a new filename, and the entry
+# point (index.html) is served ``no-store`` so it always references the
+# current hashes. A year-long immutable cache lets browsers skip even the
+# revalidation round-trip on every dashboard load.
+_IMMUTABLE_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable"
+
+
 def mount_spa(application: FastAPI):
     """Mount the built SPA. Falls back to index.html for client-side routing.
 
@@ -16049,9 +16124,32 @@ def mount_spa(application: FastAPI):
                 css = css.replace(f"url({asset_dir}", f"url({prefix}{asset_dir}")
                 css = css.replace(f"url(\"{asset_dir}", f"url(\"{prefix}{asset_dir}")
                 css = css.replace(f"url('{asset_dir}", f"url('{prefix}{asset_dir}")
-        return Response(content=css, media_type="text/css")
+        return Response(
+            content=css,
+            media_type="text/css",
+            headers={"Cache-Control": _IMMUTABLE_ASSET_CACHE_CONTROL},
+        )
 
-    application.mount("/assets", StaticFiles(directory=WEB_DIST / "assets"), name="assets")
+    class _ImmutableAssetFiles(StaticFiles):
+        """StaticFiles that marks hashed bundle assets immutable.
+
+        Everything under ``/assets/`` carries a Vite content hash in its
+        filename, so a given URL's bytes can never change — a rebuild
+        produces a NEW filename referenced by a fresh (``no-store``)
+        index.html. Without this header every dashboard load re-validated
+        each chunk; with it the browser serves reloads straight from its
+        HTTP cache.
+        """
+
+        async def get_response(self, path: str, scope):
+            response = await super().get_response(path, scope)
+            if response.status_code == 200:
+                response.headers["Cache-Control"] = _IMMUTABLE_ASSET_CACHE_CONTROL
+            return response
+
+    application.mount(
+        "/assets", _ImmutableAssetFiles(directory=WEB_DIST / "assets"), name="assets"
+    )
 
     @application.get("/{full_path:path}")
     async def serve_spa(full_path: str, request: Request):

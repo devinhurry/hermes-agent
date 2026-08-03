@@ -142,7 +142,7 @@ class TestReloadEnv:
     def test_adds_new_vars(self, tmp_path):
         """reload_env() adds vars from .env that are not in os.environ."""
         env_file = tmp_path / ".env"
-        env_file.write_text("TEST_RELOAD_VAR=hello123\n")
+        env_file.write_text("TEST_RELOAD_VAR=hello123\n", encoding="utf-8")
         with patch.dict(reload_env.__globals__, {"get_env_path": lambda: env_file}):
             os.environ.pop("TEST_RELOAD_VAR", None)
             count = reload_env()
@@ -522,6 +522,79 @@ class TestWebServerEndpoints:
     @staticmethod
     def _provider_field_map(payload):
         return {field["key"]: field for field in payload["fields"]}
+
+    def test_openviking_recall_fields_are_numeric_dashboard_controls(self):
+        resp = self.client.get("/api/memory/providers/openviking/config")
+
+        assert resp.status_code == 200
+        fields = self._provider_field_map(resp.json())
+        assert fields["recall_limit"]["kind"] == "integer"
+        assert fields["recall_limit"]["minimum"] == 1
+        assert fields["recall_limit"]["maximum"] == 100
+        assert fields["recall_score_threshold"]["kind"] == "number"
+        assert fields["recall_score_threshold"]["step"] == 0.01
+        assert fields["recall_resources"]["kind"] == "boolean"
+
+    def test_openviking_dashboard_persists_typed_recall_values(self):
+        from hermes_cli.config import load_config
+
+        resp = self.client.put(
+            "/api/memory/providers/openviking/config",
+            json={
+                "values": {
+                    "endpoint": "http://127.0.0.1:1933",
+                    "recall_limit": "12",
+                    "recall_score_threshold": "0.42",
+                    "recall_max_injected_chars": "8000",
+                    "profile_token_budget": "7000",
+                    "recall_timeout_seconds": "2.5",
+                    "recall_request_timeout_seconds": "1.5",
+                    "recall_full_read_limit": "5",
+                    "recall_prefer_abstract": True,
+                    "recall_resources": False,
+                }
+            },
+        )
+
+        assert resp.status_code == 200
+        config = load_config()["memory"]["openviking"]
+        assert config["recall_limit"] == 12
+        assert config["recall_score_threshold"] == 0.42
+        assert config["profile_token_budget"] == 7000
+        assert config["recall_prefer_abstract"] is True
+        assert config["recall_resources"] is False
+
+    def test_openviking_dashboard_rejects_out_of_range_recall_value(self):
+        resp = self.client.put(
+            "/api/memory/providers/openviking/config",
+            json={
+                "values": {
+                    "endpoint": "http://127.0.0.1:1933",
+                    "recall_limit": 101,
+                }
+            },
+        )
+
+        assert resp.status_code == 400
+        assert "must be at most 100" in resp.json()["detail"]
+
+    def test_openviking_dashboard_rejects_blocked_endpoint_before_saving(self):
+        from hermes_cli.config import load_config
+
+        resp = self.client.put(
+            "/api/memory/providers/openviking/config",
+            json={
+                "values": {
+                    "endpoint": "http://169.254.169.254/latest/meta-data/credential",
+                }
+            },
+        )
+
+        assert resp.status_code == 400
+        assert "blocked metadata address" in resp.json()["detail"]
+        assert "credential" not in resp.json()["detail"]
+        memory_config = load_config().get("memory", {})
+        assert "openviking" not in memory_config
 
 
 
@@ -2764,7 +2837,7 @@ class TestDiscoverUserThemes:
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         themes_dir = tmp_path / "dashboard-themes"
         themes_dir.mkdir()
-        (themes_dir / "mine.yaml").write_text("name: mine\n")
+        (themes_dir / "mine.yaml").write_text("name: mine\n", encoding="utf-8")
 
         other = tmp_path / "other-profile"
         other.mkdir()
@@ -3307,7 +3380,7 @@ class TestDashboardPluginManifestExtensions:
         import json
         plug_dir = tmp_path / "plugins" / name / "dashboard"
         plug_dir.mkdir(parents=True)
-        (plug_dir / "manifest.json").write_text(json.dumps(manifest))
+        (plug_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
         return plug_dir
 
     def test_override_and_hidden_carried_through(self, tmp_path, monkeypatch):
@@ -3946,6 +4019,81 @@ class TestServeIndexMissingIndex:
         resp = client.get("/chat")
         assert resp.status_code == 200
         assert "SPA-rebuilt" in resp.text
+
+
+class TestHashedAssetCacheHeaders:
+    """Hashed /assets/* responses must be immutable-cacheable; index.html
+    must stay no-store so it always references the current hashes
+    (salvaged from PR #28543)."""
+
+    _IMMUTABLE = "public, max-age=31536000, immutable"
+
+    @staticmethod
+    def _client(tmp_path, monkeypatch):
+        from fastapi import FastAPI
+        from starlette.testclient import TestClient
+        import hermes_cli.web_server as ws
+
+        dist = tmp_path / "web_dist"
+        (dist / "assets").mkdir(parents=True)
+        (dist / "index.html").write_text(
+            "<html><head></head><body>SPA</body></html>", encoding="utf-8"
+        )
+        (dist / "assets" / "index-abc123.js").write_text(
+            "console.log('bundle');", encoding="utf-8"
+        )
+        (dist / "assets" / "index-abc123.css").write_text(
+            "body{background:url(/ds-assets/bg.png);"
+            "font-family:url(/fonts-terminal/x.woff2)}",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(ws, "WEB_DIST", dist)
+        monkeypatch.delenv("HERMES_SERVE_HEADLESS", raising=False)
+        spa_app = FastAPI()
+        ws.mount_spa(spa_app)
+        return TestClient(spa_app)
+
+    def test_hashed_js_asset_is_immutable(self, tmp_path, monkeypatch):
+        client = self._client(tmp_path, monkeypatch)
+        resp = client.get("/assets/index-abc123.js")
+        assert resp.status_code == 200
+        assert resp.headers["cache-control"] == self._IMMUTABLE
+
+    def test_serve_css_is_immutable_and_keeps_prefix_rewrites(
+        self, tmp_path, monkeypatch
+    ):
+        client = self._client(tmp_path, monkeypatch)
+        resp = client.get("/assets/index-abc123.css")
+        assert resp.status_code == 200
+        assert resp.headers["cache-control"] == self._IMMUTABLE
+
+        # The proxy-prefix rewrite path (main's ds-assets/fonts-terminal
+        # handling) must survive the header change.
+        prefixed = client.get(
+            "/assets/index-abc123.css",
+            headers={"X-Forwarded-Prefix": "/hermes"},
+        )
+        assert prefixed.status_code == 200
+        assert prefixed.headers["cache-control"] == self._IMMUTABLE
+        assert "url(/hermes/ds-assets/bg.png)" in prefixed.text
+        assert "url(/hermes/fonts-terminal/x.woff2)" in prefixed.text
+
+    def test_index_html_stays_no_store(self, tmp_path, monkeypatch):
+        client = self._client(tmp_path, monkeypatch)
+        for route in ("/", "/chat"):
+            resp = client.get(route)
+            assert resp.status_code == 200
+            cache_control = resp.headers["cache-control"]
+            assert "no-store" in cache_control
+            assert "immutable" not in cache_control
+
+    def test_missing_asset_is_not_marked_immutable(self, tmp_path, monkeypatch):
+        """A 404 must never be cached for a year — a later rebuild can
+        legitimately create the file."""
+        client = self._client(tmp_path, monkeypatch)
+        resp = client.get("/assets/nope-000000.js")
+        assert resp.status_code == 404
+        assert "immutable" not in resp.headers.get("cache-control", "")
 
 
 class TestDashboardComponentHealth:
