@@ -1214,6 +1214,7 @@ def _probe_remote_backend(env_type: str) -> str | None:
         _BACKEND_PROBE_CACHE[cache_key] = ""
         return None
 
+    env = None
     try:
         config = _get_env_config()
         # Build the environment the same way tools/terminal_tool.py does for a
@@ -1294,6 +1295,20 @@ def _probe_remote_backend(env_type: str) -> str | None:
         logger.debug("Backend probe failed: %s", e)
         _BACKEND_PROBE_CACHE[cache_key] = ""
         return None
+    finally:
+        # The probe only needs a one-shot `uname`; without teardown the
+        # backend leaves a second idle sandbox (task_id="prompt-backend-probe")
+        # running for the whole process lifetime next to the agent's own one.
+        # ssh is left alone: it has no task-scoped sandbox and its cleanup()
+        # closes a ControlMaster socket (keyed by user@host:port) shared with
+        # the agent's real environment; ControlPersist expires it anyway.
+        if env is not None and env_type != "ssh":
+            try:
+                from tools.terminal_tool import _cleanup_env
+
+                _cleanup_env(env, force_remove=True)
+            except Exception:
+                logger.debug("Backend probe cleanup failed", exc_info=True)
 
     # Parse key=value lines back into a tidy summary.
     parsed: dict[str, str] = {}
