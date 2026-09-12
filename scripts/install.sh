@@ -57,6 +57,7 @@ else
     INSTALL_DIR_EXPLICIT=false
 fi
 PYTHON_VERSION="3.11"
+PYTHON_SUPPORTED_RANGE=">=3.11,<3.14"  # pyproject requires-python; keep in sync
 NODE_VERSION="26"
 
 # FHS-style root install layout (set by resolve_install_layout when applicable):
@@ -685,6 +686,18 @@ check_python() {
     if PYTHON_PATH="$("$UV_CMD" python find "$PYTHON_VERSION" 2>/dev/null)"; then
         PYTHON_FOUND_VERSION="$("$PYTHON_PATH" --version 2>/dev/null)"
         log_success "Python found: $PYTHON_FOUND_VERSION"
+        return 0
+    fi
+
+    # No 3.11, but any interpreter inside requires-python (>=3.11,<3.14) works: reuse it rather
+    # than downloading 3.11 — the download is a hard failure on hosts that cannot reach GitHub
+    # releases, and the user already has a supported Python (#10778).
+    # --system: with the install's own venv activated (a re-run), `uv python find` would return
+    # venv/bin/python3, which setup_venv is about to delete out from under itself.
+    if PYTHON_PATH="$("$UV_CMD" python find --system "$PYTHON_SUPPORTED_RANGE" 2>/dev/null)"; then
+        PYTHON_FOUND_VERSION="$("$PYTHON_PATH" --version 2>/dev/null)"
+        PYTHON_VERSION="$PYTHON_PATH"  # uv venv --python / UV_PYTHON pin onto this interpreter
+        log_success "Python found: $PYTHON_FOUND_VERSION (supported; reusing instead of downloading 3.11)"
         return 0
     fi
 
@@ -1741,8 +1754,12 @@ setup_venv() {
         rm -rf venv
     fi
 
-    # uv creates the venv and pins the Python version in one step
-    $UV_CMD venv venv --python "$PYTHON_VERSION"
+    # uv creates the venv and pins the Python version in one step. Fail loudly: `set -e` does not
+    # reach this line's callers on every path, and a missing venv used to be reported as ready.
+    if ! $UV_CMD venv venv --python "$PYTHON_VERSION" || [ ! -x "venv/bin/python" ]; then
+        log_error "Failed to create the virtual environment with Python $PYTHON_VERSION"
+        exit 1
+    fi
 
     # Neutralize any inherited UV_PYTHON (e.g. UV_PYTHON=3.14 left in the
     # user's shell env). uv honours UV_PYTHON over an existing venv for the
@@ -1755,7 +1772,7 @@ setup_venv() {
         export UV_PYTHON="$INSTALL_DIR/venv/bin/python"
     fi
 
-    log_success "Virtual environment ready (Python $PYTHON_VERSION)"
+    log_success "Virtual environment ready ($(./venv/bin/python --version 2>/dev/null || echo "Python $PYTHON_VERSION"))"
 }
 
 run_locked_uv_sync() {
