@@ -42,7 +42,9 @@ import {
 import { isSecondaryWindow } from '@/store/windows'
 
 import { MessageRenderBoundary } from '../message-render-boundary'
+import { PendingApprovalStack } from '../tool/approval'
 
+import { responseMessageRole, ResponseMessages } from './response-group'
 import { resolveShowEarlierAction, shouldAutoShowEarlier, useTranscriptWindow } from './transcript-window'
 import { useMessagesBelow } from './use-messages-below'
 import { useStickyPromptClip } from './use-sticky-prompt-clip'
@@ -406,9 +408,7 @@ const TurnRow = memo(function TurnRow({ components, group, resetKey, virtualized
             className="composer-human-ai-pair-container relative flex min-w-0 flex-col gap-(--conversation-turn-gap)"
             data-slot="aui_turn-pair"
           >
-            {group.indices.map(index => (
-              <ThreadPrimitive.MessageByIndex components={components} index={index} key={index} />
-            ))}
+            <ResponseMessages components={components} indices={group.indices} />
           </div>
         ) : (
           <ThreadPrimitive.MessageByIndex components={components} index={group.index} />
@@ -436,7 +436,7 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
   // every tick (measured: 540 wasted Block renders per explain() sample with
   // two threads streaming).
   const structuralSignature = useAuiState(s =>
-    s.thread.messages.map((message, index) => `${index}:${message.id}:${message.role}`).join('\n')
+    s.thread.messages.map((message, index) => `${index}:${message.id}:${responseMessageRole(message)}`).join('\n')
   )
 
   const weightSignature = useAuiState(s =>
@@ -1065,6 +1065,7 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
       if (contentRef.current) {
         resizeObserver.observe(contentRef.current)
       }
+
       void scrollToBottom('instant')
     }
 
@@ -1342,40 +1343,41 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
         data-slot="aui_thread-viewport"
         ref={scrollRef as React.RefCallback<HTMLDivElement>}
       >
-        {renderEmpty ? (
-          <div
-            className="mx-auto grid h-full w-full max-w-(--composer-width) grid-rows-[minmax(0,1fr)_auto] min-w-0 gap-(--conversation-turn-gap) px-6 py-8"
-            data-slot="aui_thread-content"
-          >
-            {emptyPlaceholder}
-          </div>
-        ) : (
-          <div
-            className={cn('mx-auto flex w-full max-w-(--composer-width) min-w-0 flex-col px-6', threadContentTopPad)}
-            data-slot="aui_thread-content"
-            ref={contentRef as React.RefCallback<HTMLDivElement>}
-          >
-            {(hiddenCount > 0 || olderAvailable) && (
-              <button
-                className="mx-auto mb-(--conversation-turn-gap) rounded-full border border-border/65 bg-(--composer-fill) px-3 py-1 text-xs text-muted-foreground hover:text-foreground"
-                onClick={showEarlier}
-                type="button"
-              >
-                {t.assistant.thread.showEarlier}
-              </button>
-            )}
-            {rows}
-            {loadingIndicator}
-            {clampToComposer && (
-              <div
-                aria-hidden="true"
-                className="shrink-0"
-                data-slot="aui_composer-clearance"
-                style={{ height: 'var(--thread-last-message-clearance)' }}
-              />
-            )}
-          </div>
-        )}
+        <div
+          className={cn(
+            'mx-auto flex min-h-full w-full max-w-(--composer-width) min-w-0 flex-col px-6',
+            renderEmpty ? 'py-8' : threadContentTopPad
+          )}
+          data-slot="aui_thread-content"
+          ref={contentRef as React.RefCallback<HTMLDivElement>}
+        >
+          {!renderEmpty && (hiddenCount > 0 || olderAvailable) && (
+            <button
+              className="mx-auto mb-(--conversation-turn-gap) rounded-full border border-border/65 bg-(--composer-fill) px-3 py-1 text-xs text-muted-foreground hover:text-foreground"
+              onClick={showEarlier}
+              type="button"
+            >
+              {t.assistant.thread.showEarlier}
+            </button>
+          )}
+          {renderEmpty ? (
+            <div className="grid flex-1 grid-rows-[minmax(0,1fr)_auto] gap-(--conversation-turn-gap)">
+              {emptyPlaceholder}
+            </div>
+          ) : (
+            rows
+          )}
+          <PendingApprovalStack />
+          {!renderEmpty && loadingIndicator}
+          {!renderEmpty && clampToComposer && (
+            <div
+              aria-hidden="true"
+              className="shrink-0"
+              data-slot="aui_composer-clearance"
+              style={{ height: 'var(--thread-last-message-clearance)' }}
+            />
+          )}
+        </div>
       </div>
     </div>
   )
