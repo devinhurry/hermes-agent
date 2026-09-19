@@ -12,9 +12,12 @@ from agent.context_compressor import (
     HISTORICAL_TASK_HEADING,
     SUMMARY_PREFIX,
     COMPRESSED_SUMMARY_METADATA_KEY,
+    _COMPRESSION_MARKER_PREFIX,
+    _COMPRESSION_MARKER_TEMPLATE,
     _PRUNE_MIN_CHARS,
     _summarize_tool_result,
     _is_summary_access_or_quota_error,
+    _truncate_tool_call_args_json,
 )
 from hermes_state import SessionDB
 
@@ -2263,6 +2266,27 @@ class TestThresholdTokensCap:
         assert comp.threshold_tokens == 500_000
         assert comp.threshold_tokens_cap is None
 
+    @pytest.mark.parametrize("context_length", [128_000, 272_000, 400_000, 1_000_000])
+    def test_default_config_uses_lower_effective_trigger(self, context_length):
+        """Shipped defaults: the trigger is the LOWER of the ratio trigger and the absolute cap, so a
+        1M window compacts at the cap while windows whose ratio trigger sits below it are untouched."""
+        from hermes_cli.config import DEFAULT_CONFIG
+
+        default_pct = DEFAULT_CONFIG["compression"]["threshold"]
+        default_cap = DEFAULT_CONFIG["compression"]["threshold_tokens"]
+        assert isinstance(default_cap, int) and 0 < default_cap < 1_000_000
+        with patch("agent.context_compressor.get_model_context_length", return_value=context_length):
+            ratio_only = ContextCompressor("model-a", threshold_percent=default_pct, quiet_mode=True)
+            comp = ContextCompressor(
+                "model-a", threshold_percent=default_pct, threshold_tokens_cap=default_cap, quiet_mode=True,
+            )
+            _ = ratio_only.context_length, comp.context_length
+
+        expected_threshold = min(ratio_only.threshold_tokens, default_cap)
+        assert comp.threshold_tokens == expected_threshold
+        assert comp.should_compress(expected_threshold - 1) is False
+        assert comp.should_compress(expected_threshold) is True
+
 
 
 
@@ -2304,32 +2328,23 @@ class TestThresholdTokensCap:
         assert comp.should_compress(200_000) is True    # at cap (below 500K pct)
         assert comp.should_compress(250_000) is True    # above cap
 
-    def test_default_config_disabled_and_no_behavior_change(self):
-        """DEFAULT_CONFIG ships threshold_tokens=None (disabled) and both
-        None and 0 leave the ratio-based trigger byte-identical."""
+    def test_default_config_cap_survives_model_switch(self):
+        """The shipped cap remains effective when the active model changes."""
         from hermes_cli.config import DEFAULT_CONFIG
-        assert DEFAULT_CONFIG["compression"]["threshold_tokens"] is None
 
         with patch("agent.context_compressor.get_model_context_length", return_value=1_000_000):
-            baseline = ContextCompressor(
-                "model-a", threshold_percent=0.50, quiet_mode=True,
+            comp = ContextCompressor(
+                "model-a",
+                threshold_percent=DEFAULT_CONFIG["compression"]["threshold"],
+                threshold_tokens_cap=DEFAULT_CONFIG["compression"]["threshold_tokens"],
+                quiet_mode=True,
             )
-            comp_none = ContextCompressor(
-                "model-a", threshold_percent=0.50, quiet_mode=True,
-                threshold_tokens_cap=None,
-            )
-            comp_zero = ContextCompressor(
-                "model-a", threshold_percent=0.50, quiet_mode=True,
-                threshold_tokens_cap=0,
-            )
-        assert comp_none.threshold_tokens == baseline.threshold_tokens
-        assert comp_zero.threshold_tokens == baseline.threshold_tokens
-        # And after a model switch, still identical to baseline.
-        baseline.update_model("model-b", context_length=200_000)
-        comp_none.update_model("model-b", context_length=200_000)
-        comp_zero.update_model("model-b", context_length=200_000)
-        assert comp_none.threshold_tokens == baseline.threshold_tokens
-        assert comp_zero.threshold_tokens == baseline.threshold_tokens
+            _ = comp.context_length
+
+        default_cap = DEFAULT_CONFIG["compression"]["threshold_tokens"]
+        assert comp.threshold_tokens == default_cap
+        comp.update_model("model-b", context_length=2_000_000)
+        assert comp.threshold_tokens == default_cap
 
 
 
@@ -2350,15 +2365,18 @@ class TestTruncateToolCallArgsJson:
     def test_shrunken_args_remain_valid_json(self):
         import json as _json
         shrink = self._helper()
+        content = "# Shopping Browser Setup Notes\n\n" + "abc " * 400
         original = _json.dumps({
             "path": "~/.hermes/skills/shopping/browser-setup-notes.md",
-            "content": "# Shopping Browser Setup Notes\n\n" + "abc " * 400,
+            "content": content,
         })
         assert len(original) > 500
         shrunk = shrink(original)
         parsed = _json.loads(shrunk)  # must not raise
         assert parsed["path"] == "~/.hermes/skills/shopping/browser-setup-notes.md"
-        assert parsed["content"].endswith("...[truncated]")
+        # Head preserved, marker appended at the cut (not substituted for the leaf's own text).
+        assert parsed["content"].startswith(content[:200])
+        assert parsed["content"][200:].startswith(_COMPRESSION_MARKER_PREFIX)
         assert len(shrunk) < len(original)
 
 
@@ -2379,7 +2397,8 @@ class TestTruncateToolCallArgsJson:
         assert parsed["enabled"] is True
         assert parsed["timeout"] is None
         assert parsed["items"] == [1, 2, 3]
-        assert parsed["note"].endswith("...[truncated]")
+        assert parsed["note"].startswith("z" * 200)
+        assert parsed["note"][200:].startswith(_COMPRESSION_MARKER_PREFIX)
 
 
 
@@ -2417,7 +2436,65 @@ class TestTruncateToolCallArgsJson:
         # Must parse — otherwise downstream provider returns 400
         parsed = _json.loads(shrunk)
         assert parsed["path"] == "~/.hermes/skills/shopping/browser-setup-notes.md"
-        assert parsed["content"].endswith("...[truncated]")
+        assert parsed["content"].startswith(huge_content[:200])
+        assert parsed["content"][200:].startswith(_COMPRESSION_MARKER_PREFIX)
+
+
+class TestTruncationMarkerNotImitable:
+    """Regression tests for #83714.
+
+    A model replayed its own history containing the bare
+    ``"...[truncated]"`` marker and, in a later turn, imitated it — writing
+    the literal marker into a *new* tool call's ``new_string`` instead of
+    real content. The compressor-side fix is to stop injecting a marker that
+    looks like something the model itself would plausibly write.
+    """
+
+    def test_old_bare_marker_no_longer_produced(self):
+        """The literal that caused #83714 must never come out of the shrink helper again."""
+        payload = json.dumps({"path": "/f.py", "new_string": "y" * 600})
+        shrunk = json.loads(_truncate_tool_call_args_json(payload))["new_string"]
+        assert "...[truncated]" not in shrunk
+        # ...and the leaf really was shrunk, so a no-op helper cannot pass this.
+        assert len(shrunk) < 600 and shrunk.startswith("y" * 200)
+
+    def test_args_without_a_net_gain_leaf_are_left_byte_identical(self):
+        """Leaves the marker would not shrink, and leaves that merely quote the marker.
+
+        Below the break-even (``head_chars`` + marker) replacing a leaf would grow the payload, and
+        re-serialising alone would rewrite compact wire JSON — both read as "this changed" upstream
+        and are counted as reclaimed pressure.
+        """
+        tiny = json.dumps({"new_string": "y" * 201, "pad": "z" * 320})
+        assert _truncate_tool_call_args_json(tiny) == tiny
+        compact = json.dumps({"new_string": "y" * 201, "pad": "z" * 320}, separators=(",", ":"))
+        assert _truncate_tool_call_args_json(compact) == compact
+        # Separator whitespace added by the re-serialise can exceed a single leaf's saving.
+        many_keys = json.dumps(
+            {**{f"k{i}": i for i in range(300)}, "big": "y" * 426}, separators=(",", ":")
+        )
+        assert _truncate_tool_call_args_json(many_keys) == many_keys
+
+        # The guard keys on the marker being the whole tail, so the imitation shape #83714
+        # describes — replayed head+marker followed by new content — is still shrinkable.
+        for leaf in (
+            "x" * 1000 + _COMPRESSION_MARKER_PREFIX + " 5 of 9⟫" + "y" * 500,
+            "x" * 200 + _COMPRESSION_MARKER_PREFIX + " 5 of 9 chars omitted⟫" + "y" * 5000,
+        ):
+            out = _truncate_tool_call_args_json(json.dumps({"new_string": leaf}))
+            assert json.loads(out)["new_string"] == "x" * 200 + _COMPRESSION_MARKER_TEMPLATE.format(
+                omitted=len(leaf) - 200, total=len(leaf)
+            )
+
+    def test_shrunken_leaf_is_head_plus_marker_and_a_fixed_point(self):
+        """Re-shrinking must be a no-op: the marker's counts are its anti-imitation value."""
+        payload = json.dumps({"content": "x" * 2000})
+        once = _truncate_tool_call_args_json(payload)
+        assert len(once) < len(payload)
+        assert json.loads(once)["content"] == "x" * 200 + _COMPRESSION_MARKER_TEMPLATE.format(
+            omitted=1800, total=2000
+        )
+        assert _truncate_tool_call_args_json(once) == once
 
 
 class TestLazyContextResolution:
