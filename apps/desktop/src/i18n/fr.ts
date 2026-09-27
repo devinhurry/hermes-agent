@@ -2819,6 +2819,7 @@ export const frOverrides = {
       serverStates: {
         connected: 'connecté',
         app_not_running: 'application non lancée',
+        hermes_not_connected: 'connexion MCP manquante',
         endpoint_unavailable: 'point de terminaison indisponible',
         no_interactive_session: 'aucune session interactive',
         version_too_old: 'version trop ancienne',
@@ -5614,6 +5615,8 @@ export const frOverrides = {
       preparingAudio: "Préparation de l'audio…",
       stopReading: 'Arrêter la lecture',
       readAloud: 'Lire à voix haute',
+      copyFullResponse: 'Copier la réponse complète',
+      readAloudFullResponseHint: 'Maj+clic : lire la réponse complète',
       editMessage: 'Modifier le message',
       expandMessage: 'Développer le message',
       scrollToBottom: 'Défiler vers le bas',
