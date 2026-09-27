@@ -64,6 +64,10 @@ export interface Translations {
     message: string
     copyUrl: string
     close: string
+    missing: {
+      title: string
+      message: string
+    }
   }
   intro: {
     stock: Record<string, string[]>
@@ -3305,6 +3309,7 @@ export interface Translations {
     goalWaiting: string
     subagents: (count: number) => string
     todos: (done: number, total: number) => string
+    previousTodos: (done: number, total: number) => string
     running: string
     stop: string
     dismiss: string
