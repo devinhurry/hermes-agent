@@ -2813,6 +2813,7 @@ class FeishuAdapter(FeishuChoiceCardsMixin, BasePlatformAdapter):
             self._pending_media_batches[key] = event
             self._schedule_media_batch_flush(key)
             return
+        existing.absorb_turn_input(event)
         existing.media_urls.extend(event.media_urls)
         existing.media_types.extend(event.media_types)
         existing.media_text_inlined.extend(event.media_text_inlined)
@@ -3077,6 +3078,7 @@ class FeishuAdapter(FeishuChoiceCardsMixin, BasePlatformAdapter):
             return
 
         existing.text = next_text
+        existing.absorb_turn_input(event)
         existing.media_urls.extend(event.media_urls)
         existing.media_types.extend(event.media_types)
         existing.media_text_inlined.extend(event.media_text_inlined)
